@@ -180,8 +180,17 @@ export async function pollQrCodeStatus(qrcode_key?: string): Promise<QrCodePollR
                 };
 
             case QrCodeLoginStatus.SUCCESS:
-                // 解析 Cookie
-                const credential = parseCredentialFromUrl(pollData.url, pollData.refresh_token);
+                // 解析 Cookie：优先从回调 URL 参数提取；B 站已改为通过 Set-Cookie 响应头下发登录态，
+                // URL 参数中不再携带 SESSDATA/bili_jct/DedeUserID，因此需要 Set-Cookie 兜底解析
+                const getSetCookie = (response.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+                pluginState.logDebug(
+                    `扫码成功原始数据: urlLen=${(pollData.url || '').length} urlHead=${(pollData.url || '').slice(0, 70)} setCookieCount=${
+                        typeof getSetCookie === 'function' ? getSetCookie.call(response.headers).length : -1
+                    }`
+                );
+                const credential =
+                    parseCredentialFromUrl(pollData.url, pollData.refresh_token) ||
+                    parseCredentialFromSetCookie(response.headers);
                 if (credential) {
                     // 保存凭据
                     await saveCredential(credential);
@@ -211,6 +220,51 @@ export async function pollQrCodeStatus(qrcode_key?: string): Promise<QrCodePollR
             status: QrCodeLoginStatus.EXPIRED,
             message: '请求异常',
         };
+    }
+}
+
+/**
+ * 从登录接口的 Set-Cookie 响应头中解析凭据
+ *
+ * 背景：B 站调整了扫码登录流程，扫码确认成功后，轮询接口的响应不再通过
+ * `pollData.url` 查询参数携带登录 Cookie，而是直接在 HTTP 响应的 Set-Cookie
+ * 头中下发 SESSDATA / bili_jct / DedeUserID。旧逻辑只解析 URL 参数，
+ * 导致扫码确认后提示「解析登录凭据失败」，永远无法完成登录。
+ */
+function parseCredentialFromSetCookie(headers: Headers): BilibiliCredential | null {
+    try {
+        // getSetCookie() 在部分运行时/类型库中不可用，做防御性访问
+        const getSetCookie = (headers as Headers & { getSetCookie?: () => string[] }).getSetCookie;
+        const rawCookies = typeof getSetCookie === 'function' ? getSetCookie.call(headers) : [];
+
+        const cookies: Record<string, string> = {};
+        for (const line of rawCookies) {
+            const pair = line.split(';')[0];
+            const eq = pair.indexOf('=');
+            if (eq <= 0) continue;
+            cookies[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+        }
+
+        const sessdata = cookies['SESSDATA'] || '';
+        const bili_jct = cookies['bili_jct'] || '';
+        const dedeuserid = cookies['DedeUserID'] || '';
+
+        if (!sessdata || !bili_jct || !dedeuserid) {
+            pluginState.log('error', '解析凭据失败: Set-Cookie 中缺少必要的 Cookie 字段');
+            return null;
+        }
+
+        pluginState.logDebug('从 Set-Cookie 提取到登录凭据');
+        return {
+            sessdata: decodeURIComponent(sessdata),
+            bili_jct,
+            dedeuserid,
+            refresh_token: '',
+            login_time: Date.now(),
+        };
+    } catch (error) {
+        pluginState.log('error', '解析 Set-Cookie 凭据异常:', error);
+        return null;
     }
 }
 
